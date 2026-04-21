@@ -12,6 +12,5 @@ provides_hooks:
   - on_session_end
   - on_session_finalize
   - on_session_reset
-  - subagent_stop
 pip_dependencies:
   - arize-phoenix-otel

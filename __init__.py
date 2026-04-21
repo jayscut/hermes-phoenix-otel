@@ -378,47 +378,6 @@ def _on_post_llm_call(
         logger.warning("[phoenix-otel] post_llm_call error: %s", exc)
 
 
-def _on_subagent_stop(
-    parent_session_id: str = "",
-    child_role: Optional[str] = None,
-    child_summary: Optional[str] = None,
-    child_status: str = "",
-    duration_ms: int = 0,
-    **kwargs,
-) -> None:
-    tr = _get_trace(parent_session_id)
-    if tr is None:
-        return
-    try:
-        _touch_activity(tr)
-        from openinference.semconv.trace import SpanAttributes as SA
-
-        subagent_meta = {
-            "child_role": child_role,
-            "child_status": child_status,
-            "duration_ms": duration_ms,
-        }
-        if child_summary:
-            subagent_meta["child_summary_chars"] = len(child_summary)
-            subagent_meta["child_summary"] = child_summary
-
-        existing_meta = {}
-        if hasattr(tr.root_span, "attributes"):
-            existing_meta = getattr(tr.root_span, "_attributes", {}) or {}
-
-        subagents = existing_meta.get("_subagents", [])
-        subagents.append(subagent_meta)
-        if len(subagents) == 1:
-            set_span_attributes(tr.root_span, {
-                SA.METADATA: _safe_json({
-                    "subagents": subagents,
-                    "_merge": True,
-                })
-            })
-    except Exception as exc:
-        logger.warning("[phoenix-otel] subagent_stop error: %s", exc)
-
-
 def _on_session_end(
     session_id: str = "",
     completed: bool = False,
@@ -548,7 +507,6 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
     ctx.register_hook("on_session_reset", _on_session_reset)
-    ctx.register_hook("subagent_stop", _on_subagent_stop)
 
     logger.info(
         "[phoenix-otel] Plugin registered: endpoint=%s project=%s",
