@@ -16,11 +16,14 @@
 ## 安装
 
 ```bash
-# 克隆到 Hermes 插件目录
+# 1. 安装 Python 依赖
+pip install arize-phoenix-otel
+
+# 2. 克隆到 Hermes 插件目录
 git clone <repo-url> ~/.hermes/plugins/phoenix-otel
 ```
 
-Hermes 会在下次启动时自动发现插件。所需的 pip 依赖（`arize-phoenix-otel`）会通过 `plugin.yaml` 中的 `pip_dependencies` 自动安装。
+Hermes 会在下次启动时自动发现插件。如果依赖缺失，插件会在日志中输出明确的安装提示。
 
 ## 配置
 

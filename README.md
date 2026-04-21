@@ -16,11 +16,14 @@ A complete Python port of [openclaw-phoenix-otel](https://github.com/Arize-ai/op
 ## Installation
 
 ```bash
-# Clone into the Hermes plugins directory
+# 1. Install the Python dependency
+pip install arize-phoenix-otel
+
+# 2. Clone into the Hermes plugins directory
 git clone <repo-url> ~/.hermes/plugins/phoenix-otel
 ```
 
-Hermes auto-discovers plugins on next startup. The required pip dependency (`arize-phoenix-otel`) is installed automatically via `pip_dependencies` in `plugin.yaml`.
+Hermes auto-discovers plugins on next startup. The plugin will log a clear warning with install instructions if the dependency is missing.
 
 ## Configuration
 

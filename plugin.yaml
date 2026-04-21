@@ -1,4 +1,4 @@
-name: phoenix-otel
+name: hermes-phoenix-otel
 version: 1.0.0
 description: Export LLM traces and spans to Phoenix (Arize) via OpenTelemetry
 provides_hooks:
