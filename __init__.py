@@ -9,13 +9,12 @@ Dependencies: arize-phoenix-otel  (pip install arize-phoenix-otel)
 """
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
 from typing import Any, Dict, Optional
 
-from opentelemetry.trace import Span, Status, StatusCode
+from opentelemetry.trace import Status, StatusCode
 
 from .config import resolve_config
 from .otel_bridge import (
@@ -30,8 +29,8 @@ from .otel_bridge import (
 from .span_builder import (
     build_agent_input_attributes,
     build_agent_output_attributes,
-    build_llm_per_call_attributes,
-    build_llm_per_call_output_attributes,
+    build_llm_input_attributes,
+    build_llm_output_attributes,
     build_tool_input_attributes,
     build_tool_output_attributes,
 )
@@ -63,6 +62,20 @@ def _remove_trace(session_id: str) -> None:
 
 def _touch_activity(tr: ActiveTrace) -> None:
     tr.last_activity_at = time.time()
+
+
+def _accumulate_usage(tr: ActiveTrace, usage: Optional[Dict[str, Any]]) -> None:
+    if not usage:
+        return
+    prompt_t = usage.get("prompt_tokens") or usage.get("input_tokens")
+    completion_t = usage.get("completion_tokens") or usage.get("output_tokens")
+    total_t = usage.get("total_tokens")
+    if prompt_t is not None:
+        tr.usage.input = (tr.usage.input or 0) + int(prompt_t)
+    if completion_t is not None:
+        tr.usage.output = (tr.usage.output or 0) + int(completion_t)
+    if total_t is not None:
+        tr.usage.total = (tr.usage.total or 0) + int(total_t)
 
 
 def _stale_sweep_loop() -> None:
@@ -97,9 +110,6 @@ def _sweep_stale_traces() -> None:
                 for span in list(tr.tool_spans.values()):
                     end_span(span, Status(StatusCode.ERROR, "Stale trace cleaned up"))
                 tr.tool_spans.clear()
-                for span in list(tr.subagent_spans.values()):
-                    end_span(span, Status(StatusCode.ERROR, "Stale trace cleaned up"))
-                tr.subagent_spans.clear()
                 if tr.llm_span is not None:
                     end_span(
                         tr.llm_span, Status(StatusCode.ERROR, "Stale trace cleaned up")
@@ -156,6 +166,7 @@ def _on_pre_llm_call(
             last_activity_at=time.time(),
             model=model,
             user_message=user_message,
+            conversation_history=conversation_history,
             sender_id=sender_id,
             platform=platform,
         )
@@ -193,9 +204,11 @@ def _on_pre_api_request(
             tr.api_call_count += 1
             tr.provider = provider or tr.provider
 
-        call_attrs = build_llm_per_call_attributes(
+        call_attrs = build_llm_input_attributes(
             model=model,
             provider=provider,
+            user_message=tr.user_message if api_call_count <= 1 else None,
+            conversation_history=tr.conversation_history if api_call_count <= 1 else None,
             base_url=base_url,
             api_mode=api_mode,
             api_call_count=api_call_count,
@@ -243,7 +256,7 @@ def _on_post_api_request(
                 tr.llm_span = None
 
             if span_to_end is not None:
-                output_attrs = build_llm_per_call_output_attributes(
+                output_attrs = build_llm_output_attributes(
                     usage=usage,
                     finish_reason=finish_reason,
                     api_duration=api_duration,
@@ -253,22 +266,11 @@ def _on_post_api_request(
                     api_call_count=api_call_count,
                 )
                 set_span_attributes(span_to_end, output_attrs)
-
-                if usage:
-                    prompt_t = usage.get("prompt_tokens") or usage.get("input_tokens")
-                    completion_t = usage.get("completion_tokens") or usage.get("output_tokens")
-                    total_t = usage.get("total_tokens")
-                    if prompt_t is not None:
-                        tr.usage.input = (tr.usage.input or 0) + int(prompt_t)
-                    if completion_t is not None:
-                        tr.usage.output = (tr.usage.output or 0) + int(completion_t)
-                    if total_t is not None:
-                        tr.usage.total = (tr.usage.total or 0) + int(total_t)
-
+                _accumulate_usage(tr, usage)
                 end_span(span_to_end, Status(StatusCode.OK))
         else:
             if tr.llm_span is not None:
-                output_attrs = build_llm_per_call_output_attributes(
+                output_attrs = build_llm_output_attributes(
                     usage=usage,
                     finish_reason=finish_reason,
                     api_duration=api_duration,
@@ -278,17 +280,7 @@ def _on_post_api_request(
                     api_call_count=api_call_count,
                 )
                 set_span_attributes(tr.llm_span, output_attrs)
-
-                if usage:
-                    prompt_t = usage.get("prompt_tokens") or usage.get("input_tokens")
-                    completion_t = usage.get("completion_tokens") or usage.get("output_tokens")
-                    total_t = usage.get("total_tokens")
-                    if prompt_t is not None:
-                        tr.usage.input = (tr.usage.input or 0) + int(prompt_t)
-                    if completion_t is not None:
-                        tr.usage.output = (tr.usage.output or 0) + int(completion_t)
-                    if total_t is not None:
-                        tr.usage.total = (tr.usage.total or 0) + int(total_t)
+                _accumulate_usage(tr, usage)
     except Exception as exc:
         logger.warning("[phoenix-otel] post_api_request error: %s", exc)
 
@@ -378,19 +370,8 @@ def _on_post_llm_call(
         with tr.lock:
             if tr.llm_span is not None:
                 if assistant_response:
-                    from openinference.semconv.trace import SpanAttributes as SA
-                    set_span_attributes(
-                        tr.llm_span,
-                        {
-                            SA.OUTPUT_VALUE: assistant_response,
-                            SA.OUTPUT_MIME_TYPE: "text/plain",
-                        },
-                    )
-                    output_msgs = [{"role": "assistant", "content": assistant_response}]
-                    set_span_attributes(
-                        tr.llm_span,
-                        {SA.LLM_OUTPUT_MESSAGES: _safe_json(output_msgs)},
-                    )
+                    output_attrs = build_llm_output_attributes(assistant_response=assistant_response)
+                    set_span_attributes(tr.llm_span, output_attrs)
                 end_span(tr.llm_span, Status(StatusCode.OK))
                 tr.llm_span = None
     except Exception as exc:
@@ -419,6 +400,7 @@ def _on_subagent_stop(
         }
         if child_summary:
             subagent_meta["child_summary_chars"] = len(child_summary)
+            subagent_meta["child_summary"] = child_summary
 
         existing_meta = {}
         if hasattr(tr.root_span, "attributes"):
@@ -498,10 +480,6 @@ def _finalize_trace_nolock(tr: ActiveTrace, completed: bool = False, interrupted
                 end_span(span, Status(StatusCode.ERROR, "Trace finalized"))
             tr.tool_spans.clear()
 
-            for span in list(tr.subagent_spans.values()):
-                end_span(span, Status(StatusCode.ERROR, "Trace finalized"))
-            tr.subagent_spans.clear()
-
             if tr.llm_span is not None:
                 end_span(tr.llm_span, Status(StatusCode.OK))
                 tr.llm_span = None
@@ -539,13 +517,6 @@ def _finalize_trace_nolock(tr: ActiveTrace, completed: bool = False, interrupted
             end_span(tr.root_span, Status(StatusCode.OK))
     except Exception as exc:
         logger.warning("[phoenix-otel] finalize trace error: %s", exc)
-
-
-def _safe_json(obj: Any) -> str:
-    try:
-        return json.dumps(obj, default=str, ensure_ascii=False, indent=2)
-    except Exception:
-        return "[]"
 
 
 def register(ctx) -> None:

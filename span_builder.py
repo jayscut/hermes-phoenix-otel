@@ -126,45 +126,10 @@ def build_agent_output_attributes(
 
 
 def build_llm_input_attributes(
-    model: str,
-    provider: Optional[str],
-    user_message: str,
-    conversation_history: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    messages = []
-    if conversation_history:
-        for msg in conversation_history:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    str(c.get("text", c)) if isinstance(c, dict) else str(c)
-                    for c in content
-                )
-            messages.append({"role": role, "content": sanitize_string(str(content))})
-    messages.append({"role": "user", "content": sanitize_string(user_message or "")})
-
-    input_data = {
-        "prompt": sanitize_string(user_message or ""),
-        "history_messages": len(conversation_history) if conversation_history else 0,
-    }
-
-    attrs: Dict[str, Any] = {
-        SA.OPENINFERENCE_SPAN_KIND: _SPAN_KIND_LLM,
-        SA.INPUT_VALUE: _safe_json(input_data),
-        SA.INPUT_MIME_TYPE: "application/json",
-        SA.LLM_MODEL_NAME: model or "",
-        SA.LLM_INPUT_MESSAGES: _safe_json(messages),
-    }
-    normalized = _normalize_provider(provider)
-    if normalized:
-        attrs[SA.LLM_PROVIDER] = normalized
-    return attrs
-
-
-def build_llm_per_call_attributes(
     model: str = "",
     provider: str = "",
+    user_message: Optional[str] = None,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
     base_url: str = "",
     api_mode: str = "",
     api_call_count: int = 0,
@@ -178,9 +143,33 @@ def build_llm_per_call_attributes(
         SA.OPENINFERENCE_SPAN_KIND: _SPAN_KIND_LLM,
         SA.LLM_MODEL_NAME: model or "",
     }
+
     normalized = _normalize_provider(provider)
     if normalized:
         attrs[SA.LLM_PROVIDER] = normalized
+
+    if user_message is not None:
+        messages = []
+        if conversation_history:
+            for msg in conversation_history:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        str(c.get("text", c)) if isinstance(c, dict) else str(c)
+                        for c in content
+                    )
+                messages.append({"role": role, "content": sanitize_string(str(content))})
+        messages.append({"role": "user", "content": sanitize_string(user_message or "")})
+
+        input_data: Dict[str, Any] = {
+            "prompt": sanitize_string(user_message or ""),
+        }
+        if conversation_history:
+            input_data["history_messages"] = conversation_history
+        attrs[SA.INPUT_VALUE] = _safe_json(input_data)
+        attrs[SA.INPUT_MIME_TYPE] = "application/json"
+        attrs[SA.LLM_INPUT_MESSAGES] = _safe_json(messages)
 
     invocation_params: Dict[str, Any] = {}
     if max_tokens:
@@ -194,9 +183,7 @@ def build_llm_per_call_attributes(
     if invocation_params:
         attrs[SA.LLM_INVOCATION_PARAMETERS] = _safe_json(invocation_params)
 
-    metadata: Dict[str, Any] = {
-        "api_call_index": api_call_count,
-    }
+    metadata: Dict[str, Any] = {"api_call_index": api_call_count}
     if message_count:
         metadata["message_count"] = message_count
     if tool_count:
@@ -212,9 +199,10 @@ def build_llm_per_call_attributes(
     return attrs
 
 
-def build_llm_per_call_output_attributes(
+def build_llm_output_attributes(
+    assistant_response: Optional[str] = None,
     usage: Optional[Dict[str, Any]] = None,
-    finish_reason: str = "",
+    finish_reason: Optional[str] = None,
     api_duration: float = 0,
     response_model: str = "",
     assistant_content_chars: int = 0,
@@ -222,6 +210,20 @@ def build_llm_per_call_output_attributes(
     api_call_count: int = 0,
 ) -> Dict[str, Any]:
     attrs: Dict[str, Any] = {}
+
+    output_messages = []
+    if assistant_response:
+        output_messages.append(
+            {"role": "assistant", "content": sanitize_string(assistant_response)}
+        )
+        attrs[SA.OUTPUT_VALUE] = sanitize_string(assistant_response)
+        attrs[SA.OUTPUT_MIME_TYPE] = "text/plain"
+
+    if output_messages:
+        attrs[SA.LLM_OUTPUT_MESSAGES] = _safe_json(output_messages)
+
+    if response_model:
+        attrs[SA.LLM_MODEL_NAME] = response_model
 
     if usage:
         prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
@@ -251,56 +253,12 @@ def build_llm_per_call_output_attributes(
     if api_duration:
         metadata["latency_s"] = round(api_duration, 3)
     if response_model:
-        attrs[SA.LLM_MODEL_NAME] = response_model
         metadata["response_model"] = response_model
     if assistant_content_chars:
         metadata["assistant_content_chars"] = assistant_content_chars
     if assistant_tool_calls_count:
         metadata["assistant_tool_calls_count"] = assistant_tool_calls_count
     attrs[SA.METADATA] = _safe_json(metadata)
-
-    return attrs
-
-
-def build_llm_output_attributes(
-    assistant_response: Optional[str] = None,
-    usage: Optional[Dict[str, Any]] = None,
-    finish_reason: Optional[str] = None,
-) -> Dict[str, Any]:
-    attrs: Dict[str, Any] = {}
-
-    output_messages = []
-    if assistant_response:
-        output_messages.append(
-            {"role": "assistant", "content": sanitize_string(assistant_response)}
-        )
-        attrs[SA.OUTPUT_VALUE] = sanitize_string(assistant_response)
-        attrs[SA.OUTPUT_MIME_TYPE] = "text/plain"
-
-    if output_messages:
-        attrs[SA.LLM_OUTPUT_MESSAGES] = _safe_json(output_messages)
-
-    if usage:
-        prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
-        completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
-        total_tokens = usage.get("total_tokens")
-
-        if prompt_tokens is not None:
-            attrs[SA.LLM_TOKEN_COUNT_PROMPT] = int(prompt_tokens)
-        if completion_tokens is not None:
-            attrs[SA.LLM_TOKEN_COUNT_COMPLETION] = int(completion_tokens)
-        if total_tokens is not None:
-            attrs[SA.LLM_TOKEN_COUNT_TOTAL] = int(total_tokens)
-
-        cache_read = usage.get("cache_read_tokens")
-        cache_write = usage.get("cache_write_tokens")
-        reasoning = usage.get("reasoning_tokens")
-        if cache_read is not None:
-            attrs[SA.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ] = int(cache_read)
-        if cache_write is not None:
-            attrs[SA.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE] = int(cache_write)
-        if reasoning is not None:
-            attrs[SA.LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING] = int(reasoning)
 
     return attrs
 
