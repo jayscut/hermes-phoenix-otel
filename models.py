@@ -59,4 +59,7 @@ class ActiveTrace:
     output: Optional[str] = None
     user_message: Optional[str] = None
     sender_id: Optional[str] = None
+    platform: Optional[str] = None
+    api_call_count: int = 0
+    tool_call_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)

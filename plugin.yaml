@@ -1,5 +1,5 @@
 name: hermes-phoenix-otel
-version: 1.0.0
+version: 0.2.0
 description: Export LLM traces and spans to Phoenix (Arize) via OpenTelemetry
 provides_hooks:
   - on_session_start
@@ -12,5 +12,6 @@ provides_hooks:
   - on_session_end
   - on_session_finalize
   - on_session_reset
+  - subagent_stop
 pip_dependencies:
   - arize-phoenix-otel

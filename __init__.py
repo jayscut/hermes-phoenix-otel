@@ -4,9 +4,12 @@ Hermes Phoenix OTEL Plugin — export LLM traces to Phoenix (Arize) via OpenTele
 Complete port of openclaw-phoenix-otel to the Hermes plugin system.
 Uses arize-phoenix-otel for Phoenix-aware OTel initialization and
 openinference-semantic-conventions for span attribute names.
+
+Dependencies: arize-phoenix-otel  (pip install arize-phoenix-otel)
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -27,8 +30,8 @@ from .otel_bridge import (
 from .span_builder import (
     build_agent_input_attributes,
     build_agent_output_attributes,
-    build_llm_input_attributes,
-    build_llm_output_attributes,
+    build_llm_per_call_attributes,
+    build_llm_per_call_output_attributes,
     build_tool_input_attributes,
     build_tool_output_attributes,
 )
@@ -58,8 +61,8 @@ def _remove_trace(session_id: str) -> None:
         _active_traces.pop(session_id, None)
 
 
-def _touch_activity(trace_state: ActiveTrace) -> None:
-    trace_state.last_activity_at = time.time()
+def _touch_activity(tr: ActiveTrace) -> None:
+    tr.last_activity_at = time.time()
 
 
 def _stale_sweep_loop() -> None:
@@ -113,12 +116,12 @@ def _sweep_stale_traces() -> None:
         force_flush()
 
 
-def _on_session_start(session_id: str, model: str = "", platform: str = "", **kwargs) -> None:
+def _on_session_start(session_id: str = "", model: str = "", platform: str = "", **kwargs) -> None:
     logger.debug("[phoenix-otel] Session started: %s model=%s platform=%s", session_id, model, platform)
 
 
 def _on_pre_llm_call(
-    session_id: str,
+    session_id: str = "",
     user_message: str = "",
     conversation_history: Optional[list] = None,
     is_first_turn: bool = False,
@@ -141,27 +144,20 @@ def _on_pre_llm_call(
             service_name=_config.service_name,
             platform=platform,
             sender_id=sender_id,
+            is_first_turn=is_first_turn,
         )
         root_span = start_root_span(f"Agent: {session_id}", agent_attrs)
         if root_span is None:
             return
 
-        llm_attrs = build_llm_input_attributes(
-            model=model,
-            provider=None,
-            user_message=user_message or "",
-            conversation_history=conversation_history,
-        )
-        llm_span = start_child_span(root_span, "LLM", llm_attrs)
-
         trace_state = ActiveTrace(
             root_span=root_span,
-            llm_span=llm_span,
             started_at=time.time(),
             last_activity_at=time.time(),
             model=model,
             user_message=user_message,
             sender_id=sender_id,
+            platform=platform,
         )
         _put_trace(session_id, trace_state)
     except Exception as exc:
@@ -189,15 +185,30 @@ def _on_pre_api_request(
         return
     try:
         _touch_activity(tr)
-        extra_attrs: Dict[str, Any] = {}
-        if provider:
-            from .span_builder import _normalize_provider
+        with tr.lock:
+            if tr.llm_span is not None:
+                end_span(tr.llm_span, Status(StatusCode.OK))
+                tr.llm_span = None
 
-            normalized = _normalize_provider(provider)
-            if normalized and tr.llm_span is not None:
-                from openinference.semconv.trace import SpanAttributes as SA
+            tr.api_call_count += 1
+            tr.provider = provider or tr.provider
 
-                set_span_attributes(tr.llm_span, {SA.LLM_PROVIDER: normalized})
+        call_attrs = build_llm_per_call_attributes(
+            model=model,
+            provider=provider,
+            base_url=base_url,
+            api_mode=api_mode,
+            api_call_count=api_call_count,
+            message_count=message_count,
+            tool_count=tool_count,
+            approx_input_tokens=approx_input_tokens,
+            max_tokens=max_tokens,
+            request_char_count=request_char_count,
+        )
+        llm_span = start_child_span(tr.root_span, f"LLM #{api_call_count}", call_attrs)
+        if llm_span is not None:
+            with tr.lock:
+                tr.llm_span = llm_span
     except Exception as exc:
         logger.warning("[phoenix-otel] pre_api_request error: %s", exc)
 
@@ -225,25 +236,59 @@ def _on_post_api_request(
         return
     try:
         _touch_activity(tr)
-        if tr.llm_span is None:
-            return
 
-        llm_output_attrs = build_llm_output_attributes(
-            usage=usage,
-            finish_reason=finish_reason,
-        )
-        set_span_attributes(tr.llm_span, llm_output_attrs)
+        if finish_reason == "stop" or (finish_reason != "tool_calls" and tr.llm_span is not None):
+            with tr.lock:
+                span_to_end = tr.llm_span
+                tr.llm_span = None
 
-        if usage:
-            prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
-            completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
-            total_tokens = usage.get("total_tokens")
-            if prompt_tokens is not None:
-                tr.usage.input = int(prompt_tokens)
-            if completion_tokens is not None:
-                tr.usage.output = int(completion_tokens)
-            if total_tokens is not None:
-                tr.usage.total = int(total_tokens)
+            if span_to_end is not None:
+                output_attrs = build_llm_per_call_output_attributes(
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    api_duration=api_duration,
+                    response_model=response_model or "",
+                    assistant_content_chars=assistant_content_chars,
+                    assistant_tool_calls_count=assistant_tool_calls_count,
+                    api_call_count=api_call_count,
+                )
+                set_span_attributes(span_to_end, output_attrs)
+
+                if usage:
+                    prompt_t = usage.get("prompt_tokens") or usage.get("input_tokens")
+                    completion_t = usage.get("completion_tokens") or usage.get("output_tokens")
+                    total_t = usage.get("total_tokens")
+                    if prompt_t is not None:
+                        tr.usage.input = (tr.usage.input or 0) + int(prompt_t)
+                    if completion_t is not None:
+                        tr.usage.output = (tr.usage.output or 0) + int(completion_t)
+                    if total_t is not None:
+                        tr.usage.total = (tr.usage.total or 0) + int(total_t)
+
+                end_span(span_to_end, Status(StatusCode.OK))
+        else:
+            if tr.llm_span is not None:
+                output_attrs = build_llm_per_call_output_attributes(
+                    usage=usage,
+                    finish_reason=finish_reason,
+                    api_duration=api_duration,
+                    response_model=response_model or "",
+                    assistant_content_chars=assistant_content_chars,
+                    assistant_tool_calls_count=assistant_tool_calls_count,
+                    api_call_count=api_call_count,
+                )
+                set_span_attributes(tr.llm_span, output_attrs)
+
+                if usage:
+                    prompt_t = usage.get("prompt_tokens") or usage.get("input_tokens")
+                    completion_t = usage.get("completion_tokens") or usage.get("output_tokens")
+                    total_t = usage.get("total_tokens")
+                    if prompt_t is not None:
+                        tr.usage.input = (tr.usage.input or 0) + int(prompt_t)
+                    if completion_t is not None:
+                        tr.usage.output = (tr.usage.output or 0) + int(completion_t)
+                    if total_t is not None:
+                        tr.usage.total = (tr.usage.total or 0) + int(total_t)
     except Exception as exc:
         logger.warning("[phoenix-otel] post_api_request error: %s", exc)
 
@@ -270,6 +315,7 @@ def _on_pre_tool_call(
             key = tool_call_id or f"{tool_name}:{time.time()}"
             with tr.lock:
                 tr.tool_spans[key] = span
+                tr.tool_call_count += 1
     except Exception as exc:
         logger.warning("[phoenix-otel] pre_tool_call error: %s", exc)
 
@@ -329,25 +375,66 @@ def _on_post_llm_call(
         _touch_activity(tr)
         tr.output = assistant_response
 
-        if tr.llm_span is not None:
-            from openinference.semconv.trace import SpanAttributes as SA
-
-            set_span_attributes(
-                tr.llm_span,
-                {
-                    SA.OUTPUT_VALUE: assistant_response or "",
-                    SA.OUTPUT_MIME_TYPE: "text/plain",
-                },
-            )
-            output_msgs = [{"role": "assistant", "content": assistant_response or ""}]
-            set_span_attributes(
-                tr.llm_span,
-                {SA.LLM_OUTPUT_MESSAGES: _safe_json_output(output_msgs)},
-            )
-            end_span(tr.llm_span, Status(StatusCode.OK))
-            tr.llm_span = None
+        with tr.lock:
+            if tr.llm_span is not None:
+                if assistant_response:
+                    from openinference.semconv.trace import SpanAttributes as SA
+                    set_span_attributes(
+                        tr.llm_span,
+                        {
+                            SA.OUTPUT_VALUE: assistant_response,
+                            SA.OUTPUT_MIME_TYPE: "text/plain",
+                        },
+                    )
+                    output_msgs = [{"role": "assistant", "content": assistant_response}]
+                    set_span_attributes(
+                        tr.llm_span,
+                        {SA.LLM_OUTPUT_MESSAGES: _safe_json(output_msgs)},
+                    )
+                end_span(tr.llm_span, Status(StatusCode.OK))
+                tr.llm_span = None
     except Exception as exc:
         logger.warning("[phoenix-otel] post_llm_call error: %s", exc)
+
+
+def _on_subagent_stop(
+    parent_session_id: str = "",
+    child_role: Optional[str] = None,
+    child_summary: Optional[str] = None,
+    child_status: str = "",
+    duration_ms: int = 0,
+    **kwargs,
+) -> None:
+    tr = _get_trace(parent_session_id)
+    if tr is None:
+        return
+    try:
+        _touch_activity(tr)
+        from openinference.semconv.trace import SpanAttributes as SA
+
+        subagent_meta = {
+            "child_role": child_role,
+            "child_status": child_status,
+            "duration_ms": duration_ms,
+        }
+        if child_summary:
+            subagent_meta["child_summary_chars"] = len(child_summary)
+
+        existing_meta = {}
+        if hasattr(tr.root_span, "attributes"):
+            existing_meta = getattr(tr.root_span, "_attributes", {}) or {}
+
+        subagents = existing_meta.get("_subagents", [])
+        subagents.append(subagent_meta)
+        if len(subagents) == 1:
+            set_span_attributes(tr.root_span, {
+                SA.METADATA: _safe_json({
+                    "subagents": subagents,
+                    "_merge": True,
+                })
+            })
+    except Exception as exc:
+        logger.warning("[phoenix-otel] subagent_stop error: %s", exc)
 
 
 def _on_session_end(
@@ -362,7 +449,7 @@ def _on_session_end(
     if tr is None:
         return
     try:
-        _finalize_trace(tr, session_id)
+        _finalize_trace(tr, session_id, completed=completed, interrupted=interrupted)
     except Exception as exc:
         logger.warning("[phoenix-otel] on_session_end error: %s", exc)
 
@@ -399,12 +486,12 @@ def _on_session_reset(
         _finalize_trace(tr, session_id)
 
 
-def _finalize_trace(tr: ActiveTrace, session_id: str) -> None:
-    _finalize_trace_nolock(tr)
+def _finalize_trace(tr: ActiveTrace, session_id: str, completed: bool = False, interrupted: bool = False) -> None:
+    _finalize_trace_nolock(tr, completed=completed, interrupted=interrupted)
     _remove_trace(session_id)
 
 
-def _finalize_trace_nolock(tr: ActiveTrace) -> None:
+def _finalize_trace_nolock(tr: ActiveTrace, completed: bool = False, interrupted: bool = False) -> None:
     try:
         with tr.lock:
             for span in list(tr.tool_spans.values()):
@@ -419,12 +506,34 @@ def _finalize_trace_nolock(tr: ActiveTrace) -> None:
                 end_span(tr.llm_span, Status(StatusCode.OK))
                 tr.llm_span = None
 
+            duration_s = time.time() - tr.started_at if tr.started_at else None
+            usage_dict: Dict[str, Any] = {}
+            if tr.usage.input is not None:
+                usage_dict["prompt_tokens"] = tr.usage.input
+            if tr.usage.output is not None:
+                usage_dict["completion_tokens"] = tr.usage.output
+            if tr.usage.total is not None:
+                usage_dict["total_tokens"] = tr.usage.total
+            if tr.usage.cache_read is not None:
+                usage_dict["cache_read_tokens"] = tr.usage.cache_read
+            if tr.usage.cache_write is not None:
+                usage_dict["cache_write_tokens"] = tr.usage.cache_write
+            if tr.usage.reasoning is not None:
+                usage_dict["reasoning_tokens"] = tr.usage.reasoning
+
             output_attrs = build_agent_output_attributes(
                 assistant_response=tr.output,
                 model=tr.model,
+                platform=tr.platform,
                 tokens_prompt=tr.usage.input,
                 tokens_completion=tr.usage.output,
                 tokens_total=tr.usage.total,
+                completed=completed,
+                interrupted=interrupted,
+                duration_s=duration_s,
+                api_call_count=tr.api_call_count,
+                tool_call_count=tr.tool_call_count,
+                usage=usage_dict if usage_dict else None,
             )
             set_span_attributes(tr.root_span, output_attrs)
             end_span(tr.root_span, Status(StatusCode.OK))
@@ -432,11 +541,9 @@ def _finalize_trace_nolock(tr: ActiveTrace) -> None:
         logger.warning("[phoenix-otel] finalize trace error: %s", exc)
 
 
-def _safe_json_output(obj: Any) -> str:
-    import json
-
+def _safe_json(obj: Any) -> str:
     try:
-        return json.dumps(obj, default=str, ensure_ascii=False)
+        return json.dumps(obj, default=str, ensure_ascii=False, indent=2)
     except Exception:
         return "[]"
 
@@ -470,6 +577,7 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
     ctx.register_hook("on_session_reset", _on_session_reset)
+    ctx.register_hook("subagent_stop", _on_subagent_stop)
 
     logger.info(
         "[phoenix-otel] Plugin registered: endpoint=%s project=%s",

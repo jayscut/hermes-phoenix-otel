@@ -19,12 +19,23 @@ SA = SpanAttributes
 
 def _safe_json(obj: Any, max_len: int = 64000) -> str:
     try:
-        s = json.dumps(obj, default=str, ensure_ascii=False)
+        s = json.dumps(obj, default=str, ensure_ascii=False, indent=2)
         if len(s) > max_len:
-            s = s[:max_len] + "...[truncated]"
+            s = s[:max_len] + "\n...[truncated]"
         return s
     except Exception:
         return str(obj)[:max_len]
+
+
+def _try_parse_json(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return value
 
 
 def _normalize_provider(provider: Optional[str]) -> Optional[str]:
@@ -44,6 +55,7 @@ def build_agent_input_attributes(
     service_name: str,
     platform: Optional[str] = None,
     sender_id: Optional[str] = None,
+    is_first_turn: bool = False,
 ) -> Dict[str, Any]:
     attrs: Dict[str, Any] = {
         SA.OPENINFERENCE_SPAN_KIND: _SPAN_KIND_AGENT,
@@ -55,6 +67,12 @@ def build_agent_input_attributes(
     }
     if sender_id:
         attrs[SA.USER_ID] = sender_id
+    metadata: Dict[str, Any] = {}
+    if platform:
+        metadata["platform"] = platform
+    metadata["is_first_turn"] = is_first_turn
+    if metadata:
+        attrs[SA.METADATA] = _safe_json(metadata)
     return attrs
 
 
@@ -66,6 +84,12 @@ def build_agent_output_attributes(
     tokens_prompt: Optional[int] = None,
     tokens_completion: Optional[int] = None,
     tokens_total: Optional[int] = None,
+    completed: Optional[bool] = None,
+    interrupted: Optional[bool] = None,
+    duration_s: Optional[float] = None,
+    api_call_count: int = 0,
+    tool_call_count: int = 0,
+    usage: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     attrs: Dict[str, Any] = {}
     if assistant_response is not None:
@@ -78,8 +102,20 @@ def build_agent_output_attributes(
         metadata["model"] = model
     if session_id:
         metadata["session_id"] = session_id
+    if completed is not None:
+        metadata["completed"] = completed
+    if interrupted is not None:
+        metadata["interrupted"] = interrupted
+    if duration_s is not None:
+        metadata["duration_s"] = round(duration_s, 2)
+    if api_call_count:
+        metadata["api_call_count"] = api_call_count
+    if tool_call_count:
+        metadata["tool_call_count"] = tool_call_count
+    if usage:
+        metadata["usage"] = usage
     if metadata:
-        attrs[SA.METADATA] = json.dumps(metadata)
+        attrs[SA.METADATA] = _safe_json(metadata)
     if tokens_prompt is not None:
         attrs[SA.LLM_TOKEN_COUNT_PROMPT] = tokens_prompt
     if tokens_completion is not None:
@@ -126,6 +162,106 @@ def build_llm_input_attributes(
     return attrs
 
 
+def build_llm_per_call_attributes(
+    model: str = "",
+    provider: str = "",
+    base_url: str = "",
+    api_mode: str = "",
+    api_call_count: int = 0,
+    message_count: int = 0,
+    tool_count: int = 0,
+    approx_input_tokens: int = 0,
+    max_tokens: int = 0,
+    request_char_count: int = 0,
+) -> Dict[str, Any]:
+    attrs: Dict[str, Any] = {
+        SA.OPENINFERENCE_SPAN_KIND: _SPAN_KIND_LLM,
+        SA.LLM_MODEL_NAME: model or "",
+    }
+    normalized = _normalize_provider(provider)
+    if normalized:
+        attrs[SA.LLM_PROVIDER] = normalized
+
+    invocation_params: Dict[str, Any] = {}
+    if max_tokens:
+        invocation_params["max_tokens"] = max_tokens
+    if api_mode:
+        invocation_params["api_mode"] = api_mode
+    if model:
+        invocation_params["model"] = model
+    if provider:
+        invocation_params["provider"] = provider
+    if invocation_params:
+        attrs[SA.LLM_INVOCATION_PARAMETERS] = _safe_json(invocation_params)
+
+    metadata: Dict[str, Any] = {
+        "api_call_index": api_call_count,
+    }
+    if message_count:
+        metadata["message_count"] = message_count
+    if tool_count:
+        metadata["tool_count"] = tool_count
+    if approx_input_tokens:
+        metadata["approx_input_tokens"] = approx_input_tokens
+    if request_char_count:
+        metadata["request_char_count"] = request_char_count
+    if base_url:
+        metadata["base_url"] = base_url
+    attrs[SA.METADATA] = _safe_json(metadata)
+
+    return attrs
+
+
+def build_llm_per_call_output_attributes(
+    usage: Optional[Dict[str, Any]] = None,
+    finish_reason: str = "",
+    api_duration: float = 0,
+    response_model: str = "",
+    assistant_content_chars: int = 0,
+    assistant_tool_calls_count: int = 0,
+    api_call_count: int = 0,
+) -> Dict[str, Any]:
+    attrs: Dict[str, Any] = {}
+
+    if usage:
+        prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
+        completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
+        total_tokens = usage.get("total_tokens")
+
+        if prompt_tokens is not None:
+            attrs[SA.LLM_TOKEN_COUNT_PROMPT] = int(prompt_tokens)
+        if completion_tokens is not None:
+            attrs[SA.LLM_TOKEN_COUNT_COMPLETION] = int(completion_tokens)
+        if total_tokens is not None:
+            attrs[SA.LLM_TOKEN_COUNT_TOTAL] = int(total_tokens)
+
+        cache_read = usage.get("cache_read_tokens")
+        cache_write = usage.get("cache_write_tokens")
+        reasoning = usage.get("reasoning_tokens")
+        if cache_read is not None:
+            attrs[SA.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ] = int(cache_read)
+        if cache_write is not None:
+            attrs[SA.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE] = int(cache_write)
+        if reasoning is not None:
+            attrs[SA.LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING] = int(reasoning)
+
+    metadata: Dict[str, Any] = {"api_call_index": api_call_count}
+    if finish_reason:
+        metadata["finish_reason"] = finish_reason
+    if api_duration:
+        metadata["latency_s"] = round(api_duration, 3)
+    if response_model:
+        attrs[SA.LLM_MODEL_NAME] = response_model
+        metadata["response_model"] = response_model
+    if assistant_content_chars:
+        metadata["assistant_content_chars"] = assistant_content_chars
+    if assistant_tool_calls_count:
+        metadata["assistant_tool_calls_count"] = assistant_tool_calls_count
+    attrs[SA.METADATA] = _safe_json(metadata)
+
+    return attrs
+
+
 def build_llm_output_attributes(
     assistant_response: Optional[str] = None,
     usage: Optional[Dict[str, Any]] = None,
@@ -156,24 +292,15 @@ def build_llm_output_attributes(
         if total_tokens is not None:
             attrs[SA.LLM_TOKEN_COUNT_TOTAL] = int(total_tokens)
 
-        details = usage.get("prompt_tokens_details", {})
-        if isinstance(details, dict):
-            cache_read = details.get("cache_read_tokens") or details.get(
-                "cached_tokens"
-            )
-            cache_write = details.get("cache_write_tokens") or details.get(
-                "cache_creation_tokens"
-            )
-            if cache_read is not None:
-                attrs[SA.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ] = int(cache_read)
-            if cache_write is not None:
-                attrs[SA.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE] = int(cache_write)
-
-        completion_details = usage.get("completion_tokens_details", {})
-        if isinstance(completion_details, dict):
-            reasoning = completion_details.get("reasoning_tokens")
-            if reasoning is not None:
-                attrs[SA.LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING] = int(reasoning)
+        cache_read = usage.get("cache_read_tokens")
+        cache_write = usage.get("cache_write_tokens")
+        reasoning = usage.get("reasoning_tokens")
+        if cache_read is not None:
+            attrs[SA.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ] = int(cache_read)
+        if cache_write is not None:
+            attrs[SA.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE] = int(cache_write)
+        if reasoning is not None:
+            attrs[SA.LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING] = int(reasoning)
 
     return attrs
 
@@ -197,8 +324,16 @@ def build_tool_output_attributes(
 ) -> Dict[str, Any]:
     attrs: Dict[str, Any] = {}
     if is_error:
-        attrs[SA.OUTPUT_VALUE] = _safe_json({"error": str(result)})
+        parsed = _try_parse_json(result)
+        if isinstance(parsed, (dict, list)):
+            attrs[SA.OUTPUT_VALUE] = _safe_json(parsed)
+        else:
+            attrs[SA.OUTPUT_VALUE] = _safe_json({"error": str(result)})
     else:
-        attrs[SA.OUTPUT_VALUE] = _safe_json(sanitize_value(result))
+        parsed = _try_parse_json(result)
+        if isinstance(parsed, (dict, list)):
+            attrs[SA.OUTPUT_VALUE] = _safe_json(sanitize_value(parsed))
+        else:
+            attrs[SA.OUTPUT_VALUE] = _safe_json(sanitize_value(result))
     attrs[SA.OUTPUT_MIME_TYPE] = "application/json"
     return attrs
