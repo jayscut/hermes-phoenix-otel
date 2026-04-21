@@ -17,16 +17,6 @@ _SPAN_KIND_TOOL = OpenInferenceSpanKindValues.TOOL.value
 SA = SpanAttributes
 
 
-def _safe_json(obj: Any, max_len: int = 64000) -> str:
-    try:
-        s = json.dumps(obj, default=str, ensure_ascii=False, indent=2)
-        if len(s) > max_len:
-            s = s[:max_len] + "\n...[truncated]"
-        return s
-    except Exception:
-        return str(obj)[:max_len]
-
-
 def _try_parse_json(value: Any) -> Any:
     if isinstance(value, str):
         try:
@@ -72,7 +62,7 @@ def build_agent_input_attributes(
         metadata["platform"] = platform
     metadata["is_first_turn"] = is_first_turn
     if metadata:
-        attrs[SA.METADATA] = _safe_json(metadata)
+        attrs[SA.METADATA] = metadata
     return attrs
 
 
@@ -115,7 +105,7 @@ def build_agent_output_attributes(
     if usage:
         metadata["usage"] = usage
     if metadata:
-        attrs[SA.METADATA] = _safe_json(metadata)
+        attrs[SA.METADATA] = metadata
     if tokens_prompt is not None:
         attrs[SA.LLM_TOKEN_COUNT_PROMPT] = tokens_prompt
     if tokens_completion is not None:
@@ -167,9 +157,9 @@ def build_llm_input_attributes(
         }
         if conversation_history:
             input_data["history_messages"] = conversation_history
-        attrs[SA.INPUT_VALUE] = _safe_json(input_data)
+        attrs[SA.INPUT_VALUE] = input_data
         attrs[SA.INPUT_MIME_TYPE] = "application/json"
-        attrs[SA.LLM_INPUT_MESSAGES] = _safe_json(messages)
+        attrs[SA.LLM_INPUT_MESSAGES] = messages
 
     invocation_params: Dict[str, Any] = {}
     if max_tokens:
@@ -181,7 +171,7 @@ def build_llm_input_attributes(
     if provider:
         invocation_params["provider"] = provider
     if invocation_params:
-        attrs[SA.LLM_INVOCATION_PARAMETERS] = _safe_json(invocation_params)
+        attrs[SA.LLM_INVOCATION_PARAMETERS] = invocation_params
 
     metadata: Dict[str, Any] = {"api_call_index": api_call_count}
     if message_count:
@@ -194,7 +184,7 @@ def build_llm_input_attributes(
         metadata["request_char_count"] = request_char_count
     if base_url:
         metadata["base_url"] = base_url
-    attrs[SA.METADATA] = _safe_json(metadata)
+    attrs[SA.METADATA] = metadata
 
     return attrs
 
@@ -220,7 +210,7 @@ def build_llm_output_attributes(
         attrs[SA.OUTPUT_MIME_TYPE] = "text/plain"
 
     if output_messages:
-        attrs[SA.LLM_OUTPUT_MESSAGES] = _safe_json(output_messages)
+        attrs[SA.LLM_OUTPUT_MESSAGES] = output_messages
 
     if response_model:
         attrs[SA.LLM_MODEL_NAME] = response_model
@@ -258,7 +248,7 @@ def build_llm_output_attributes(
         metadata["assistant_content_chars"] = assistant_content_chars
     if assistant_tool_calls_count:
         metadata["assistant_tool_calls_count"] = assistant_tool_calls_count
-    attrs[SA.METADATA] = _safe_json(metadata)
+    attrs[SA.METADATA] = metadata
 
     return attrs
 
@@ -270,7 +260,7 @@ def build_tool_input_attributes(
     attrs: Dict[str, Any] = {
         SA.OPENINFERENCE_SPAN_KIND: _SPAN_KIND_TOOL,
         SA.TOOL_NAME: tool_name,
-        SA.INPUT_VALUE: _safe_json(sanitize_value(args)),
+        SA.INPUT_VALUE: sanitize_value(args),
         SA.INPUT_MIME_TYPE: "application/json",
     }
     return attrs
@@ -284,14 +274,14 @@ def build_tool_output_attributes(
     if is_error:
         parsed = _try_parse_json(result)
         if isinstance(parsed, (dict, list)):
-            attrs[SA.OUTPUT_VALUE] = _safe_json(parsed)
+            attrs[SA.OUTPUT_VALUE] = parsed
         else:
-            attrs[SA.OUTPUT_VALUE] = _safe_json({"error": str(result)})
+            attrs[SA.OUTPUT_VALUE] = {"error": str(result)}
     else:
         parsed = _try_parse_json(result)
         if isinstance(parsed, (dict, list)):
-            attrs[SA.OUTPUT_VALUE] = _safe_json(sanitize_value(parsed))
+            attrs[SA.OUTPUT_VALUE] = sanitize_value(parsed)
         else:
-            attrs[SA.OUTPUT_VALUE] = _safe_json(sanitize_value(result))
+            attrs[SA.OUTPUT_VALUE] = sanitize_value(result)
     attrs[SA.OUTPUT_MIME_TYPE] = "application/json"
     return attrs
